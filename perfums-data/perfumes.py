@@ -1,34 +1,77 @@
+# ============================================================
+# PERFUMES — Integración Fragrantica + eBay (precios)
+# Objetivo:
+#   1) Cargar robustamente 4 CSV (distintos encodings/separadores)
+#   2) Normalizar marca y nombre para matching
+#   3) Unir eBay (men+women) y agregar precios robustos por producto
+#   4) Matching exacto + fuzzy dentro de marca (índices alineados)
+#   5) Crear columnas price y price_range y guardar dataset final
+# ============================================================
+
+# -------------------------
+# 0) IMPORTS
+# -------------------------
 import pandas as pd
 import numpy as np
 import re
 import unicodedata
 
-import pandas as pd
+# Opcional: fuzzy matching (si no está instalado, saltamos la parte fuzzy)
+try:
+    from rapidfuzz import process, fuzz
+    HAS_RAPIDFUZZ = True
+except Exception:
+    HAS_RAPIDFUZZ = False
+    print("[AVISO] 'rapidfuzz' no está instalado. Se hará solo matching exacto. "
+          "Instala con: pip install rapidfuzz")
 
-# rutas relativas (porque perfumes.py está en la misma carpeta)
+# -------------------------
+# 1) RUTAS (ajusta si mueves el script)
+# -------------------------
 PATH_FRA_PERFUMES = "fra_perfumes.csv"
 PATH_FRA_CLEANED  = "fra_cleaned.csv"
 PATH_EBAY_MEN     = "ebay_mens_perfume.csv"
 PATH_EBAY_WOMEN   = "ebay_womens_perfume.csv"
 
-# cargar
-fra_perfumes = pd.read_csv(PATH_FRA_PERFUMES)
-fra_cleaned  = pd.read_csv(PATH_FRA_CLEANED)
-ebay_men     = pd.read_csv(PATH_EBAY_MEN)
-ebay_women   = pd.read_csv(PATH_EBAY_WOMEN)
+# -------------------------
+# 2) LECTURA ROBUSTA
+#    Maneja UTF-8/latin1/cp1252 y autodetección de separador
+# -------------------------
+def read_csv_robust(path, nrows=None):
+    attempts = [
+        dict(),  # utf-8
+        dict(encoding="utf-8-sig"),
+        dict(encoding="latin1"),
+        dict(encoding="cp1252"),
+        dict(sep=None, engine="python"),
+        dict(sep=None, engine="python", encoding="latin1"),
+        dict(sep=None, engine="python", encoding="cp1252"),
+        # pandas >=2.0
+        dict(encoding="latin1", encoding_errors="ignore"),
+        dict(sep=None, engine="python", encoding="latin1", encoding_errors="ignore"),
+    ]
+    last_err = None
+    for kw in attempts:
+        try:
+            return pd.read_csv(path, nrows=nrows, **kw)
+        except Exception as e:
+            last_err = e
+    raise last_err
 
+fra_perfumes = read_csv_robust(PATH_FRA_PERFUMES)
+fra_cleaned  = read_csv_robust(PATH_FRA_CLEANED)
+ebay_men     = read_csv_robust(PATH_EBAY_MEN)
+ebay_women   = read_csv_robust(PATH_EBAY_WOMEN)
 
-# Unimos eBay (hombres + mujeres)
-ebay_raw = pd.concat([ebay_men, ebay_women], ignore_index=True)
-
-# Si 'fra_cleaned' trae las columnas buenas, usamos esa; si no, caemos a fra_perfumes
+# -------------------------
+# 3) BASE PRINCIPAL: preferimos fra_cleaned si ya trae columnas limpias
+# -------------------------
 def has_clean_cols(df):
     needed = {"Perfume","Brand","Rating Value","Rating Count","Year"}
     return needed.issubset(set(df.columns))
 
 base = fra_cleaned.copy() if has_clean_cols(fra_cleaned) else fra_perfumes.copy()
 
-# Para trabajar a gusto, nos quedamos con columnas relevantes si existen:
 keep_cols = [
     "url", "Perfume", "Brand", "Country", "Gender",
     "Rating Value", "Rating Count", "Year",
@@ -38,7 +81,6 @@ keep_cols = [
 ]
 base = base[[c for c in keep_cols if c in base.columns]].copy()
 
-# Renombramos a snake_case
 rename_map = {
     "Perfume":"name", "Brand":"brand", "Country":"country", "Gender":"gender",
     "Rating Value":"rating_value", "Rating Count":"rating_count", "Year":"year",
@@ -49,82 +91,48 @@ rename_map = {
 }
 base.rename(columns=rename_map, inplace=True)
 
-# Tipados
 for c in ["rating_value","rating_count","year"]:
-    if c in base.columns: base[c] = pd.to_numeric(base[c], errors="coerce")
+    if c in base.columns:
+        base[c] = pd.to_numeric(base[c], errors="coerce")
 
+# -------------------------
+# 4) UNIR EBAY (men + women) y PREPARAR CAMPOS
+# -------------------------
+ebay_raw = pd.concat([ebay_men, ebay_women], ignore_index=True)
 
-def strip_accents(s: str) -> str:
-    s = unicodedata.normalize("NFKD", s)
-    return "".join(ch for ch in s if not unicodedata.combining(ch))
-
-def normalize_text(s: str) -> str:
-    if pd.isna(s): return ""
-    s = str(s).lower().strip()
-    s = strip_accents(s)
-    # quitar tamaños y ediciones comunes
-    s = re.sub(r"\b(\d+)\s?ml\b", " ", s)               # 50ml, 100 ml
-    s = re.sub(r"\b(eau de parfum|eau de toilette|parfum|edt|edp|edc)\b", " ", s)
-    s = re.sub(r"[\-_/.,:;!()&']", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-# Sinónimos de marca comunes (añade más según veas en tu EDA)
-brand_syn = {
-    "christian dior": "dior",
-    "ysl": "yves saint laurent",
-    "yves-saint-laurent": "yves saint laurent",
-    "jean paul gaultier": "jean paul gaultier",
-    "giorgio armani": "armani",
-    "armani": "armani",
-}
-
-def normalize_brand(s: str) -> str:
-    t = normalize_text(s)
-    return brand_syn.get(t, t)
-
-# Fragrantica (base)
-base["brand_norm"] = base["brand"].apply(normalize_brand)
-base["name_norm"]  = base["name"].apply(normalize_text)
-
-
-
-
-# Detectores de columnas
 def pick_col(df, candidates):
     for c in candidates:
-        if c in df.columns: return c
+        if c in df.columns:
+            return c
     return None
 
-ebay = ebay_raw.copy()
-
-col_brand = pick_col(ebay, ["brand","Brand","seller_brand","perfume_brand","Brand Name"])
-col_name  = pick_col(ebay, ["name","title","product_name","Perfume","perfume_name","Item Title"])
-col_price = pick_col(ebay, ["price","Price","current_price","selling_price","Converted Price","Item Price"])
+col_brand = pick_col(ebay_raw, ["brand","Brand","seller_brand","perfume_brand","Brand Name"])
+col_name  = pick_col(ebay_raw, ["name","title","product_name","Perfume","perfume_name","Item Title"])
+col_price = pick_col(ebay_raw, ["price","Price","current_price","selling_price","Converted Price","Item Price"])
 
 if not all([col_brand, col_name, col_price]):
-    raise ValueError(f"Necesito brand/name/price en eBay. Encontrado: brand={col_brand}, name={col_name}, price={col_price}")
+    raise ValueError(f"[ERROR] No encuentro columnas brand/name/price en eBay. "
+                     f"brand={col_brand}, name={col_name}, price={col_price}")
 
-ebay = ebay[[col_brand, col_name, col_price]].rename(columns={
+ebay = ebay_raw[[col_brand, col_name, col_price]].rename(columns={
     col_brand: "brand",
     col_name:  "name",
     col_price: "price_raw"
 })
 
-# limpiar precio: "€29,99", "EUR 45.00", "US $89.99", "69,00"
+# Limpieza robusta de precio desde string a float
 def to_price(x):
-    if pd.isna(x): return np.nan
+    if pd.isna(x): 
+        return np.nan
     s = str(x)
-    # quitar moneda y texto
-    s = re.sub(r"[^\d,.\-]", "", s)      # deja dígitos, coma y punto
-    # si hay ambas coma y punto, asumimos formato europeo "1.234,56" -> "1234.56"
+    s = re.sub(r"[^\d,.\-]", "", s)  # deja dígitos/coma/punto
+    # Caso mixto coma+punto: formato europeo "1.234,56" -> "1234.56"
     if "," in s and "." in s:
         if s.rfind(",") > s.rfind("."):
             s = s.replace(".", "").replace(",", ".")
         else:
             s = s.replace(",", "")
     else:
-        # si solo hay coma, cambiar a punto
         if "," in s and "." not in s:
             s = s.replace(",", ".")
     try:
@@ -134,11 +142,58 @@ def to_price(x):
 
 ebay["price"] = ebay["price_raw"].apply(to_price)
 
-# Normalizados para matching
+# -------------------------
+# 5) NORMALIZACIÓN PARA MATCHING (marca y nombre)
+# -------------------------
+def strip_accents(s: str) -> str:
+    s = unicodedata.normalize("NFKD", s)
+    return "".join(ch for ch in s if not unicodedata.combining(ch))
+
+# Tokens comunes a eliminar de los nombres (mejora cobertura exacta)
+BAD_TOKENS = r"\b(eau de parfum|eau de toilette|parfum|edt|edp|edc|tester|gift set|set|limited edition|intense|extreme|pride|collector|spray|refill|mini|travel|vaporisateur)\b"
+
+def normalize_text(s: str) -> str:
+    if pd.isna(s): 
+        return ""
+    s = str(s).lower().strip()
+    s = strip_accents(s)
+    s = re.sub(r"\b(\d+)\s?ml\b", " ", s)         # 50ml, 100 ml
+    s = re.sub(BAD_TOKENS, " ", s)                # tokens no distintivos
+    s = re.sub(r"[\-_/.,:;!()&+']", " ", s)       # separadores y signos
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+# Sinónimos de marca (extiende según tu EDA)
+brand_syn = {
+    "christian dior": "dior",
+    "dior": "dior",
+    "ysl": "yves saint laurent",
+    "yves-saint-laurent": "yves saint laurent",
+    "jean paul gaultier": "jean paul gaultier",
+    "guerlain": "guerlain",
+    "armani": "armani",
+    "giorgio armani": "armani",
+    "dolce gabbana": "dolce gabbana",
+    "d&g": "dolce gabbana",
+    "victor and rolf": "viktor rolf",
+    "viktor&rolf": "viktor rolf",
+}
+
+def normalize_brand(s: str) -> str:
+    t = normalize_text(s)
+    return brand_syn.get(t, t)
+
+# Aplica normalización en ambos mundos
+base["brand_norm"] = base["brand"].apply(normalize_brand)
+base["name_norm"]  = base["name"].apply(normalize_text)
+
 ebay["brand_norm"] = ebay["brand"].apply(normalize_brand)
 ebay["name_norm"]  = ebay["name"].apply(normalize_text)
 
-# Agregamos por (brand_norm, name_norm) con precio "robusto"
+# -------------------------
+# 6) AGREGAR PRECIOS EN EBAY POR (brand_norm, name_norm)
+#    Usamos mediana y recortamos outliers por IQR
+# -------------------------
 ebay_agg = (ebay
             .groupby(["brand_norm","name_norm"], as_index=False)
             .agg(price_median=("price","median"),
@@ -146,76 +201,138 @@ ebay_agg = (ebay
                  price_max=("price","max"),
                  n_listings=("price","size")))
 
-# (opcional) recorte de outliers por IQR en price_median
-q1, q3 = ebay_agg["price_median"].quantile([0.25, 0.75])
-iqr = q3 - q1
-low, high = q1 - 1.5*iqr, q3 + 1.5*iqr
-ebay_agg["price_median_clipped"] = ebay_agg["price_median"].clip(lower=low, upper=high)
+if not ebay_agg.empty and ebay_agg["price_median"].notna().any():
+    q1, q3 = ebay_agg["price_median"].quantile([0.25, 0.75])
+    iqr = q3 - q1
+    low, high = q1 - 1.5*iqr, q3 + 1.5*iqr
+    ebay_agg["price_median_clipped"] = ebay_agg["price_median"].clip(lower=low, upper=high)
+else:
+    ebay_agg["price_median_clipped"] = np.nan
 
+# ---------- 6bis) Funciones extra de normalización ----------
+YEAR_TOKENS = r"\b(19\d{2}|20\d{2})\b"   # 1980..2099, limpia años del nombre
+GENDER_TOKENS = r"\b(for (men|him)|for (women|her)|men|man|women|woman|male|female|unisex)\b"
 
+def normalize_name_stronger(s: str) -> str:
+    s = normalize_text(s)
+    s = re.sub(YEAR_TOKENS, " ", s)
+    s = re.sub(r"\(.*?\)", " ", s)           # quita paréntesis y su contenido
+    s = re.sub(GENDER_TOKENS, " ", s)
+    s = re.sub(r"\b(limited|exclusive|collector|tester|intense|extreme|elixir|noir|sport|fresh|summer|night|day|pride|holiday|gift|set)\b", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-merged_exact = base.merge(
-    ebay_agg,
+def core_tokens(name: str, top_k: int = 3) -> str:
+    """Elige tokens 'fuertes': sin palabras muy cortas, quita stop-words olfativas comunes.
+       Devuelve los primeros K tokens “representativos” concatenados (orden estable)."""
+    if not name:
+        return ""
+    toks = name.split()
+    # stop-words sencillas (añade más según veas)
+    stop = set(["eau","de","le","la","the","and","pour","for","with","by",
+                "intense","extreme","elixir","noir","sport","fresh","summer",
+                "edt","edp","edc","parfum","toilette","spray","refill",
+                "tester","set","gift","mini","travel"])
+    toks = [t for t in toks if len(t) > 2 and t not in stop]
+    return " ".join(toks[:top_k])
+
+# Aplica normalización fuerte y core_name
+base["name_strong"] = base["name"].apply(normalize_name_stronger)
+ebay["name_strong"] = ebay["name"].apply(normalize_name_stronger)
+
+base["core_name"] = base["name_strong"].apply(lambda s: core_tokens(s, top_k=3))
+ebay["core_name"] = ebay["name_strong"].apply(lambda s: core_tokens(s, top_k=3))
+
+# Reagrega eBay por (brand_norm, name_norm) ya lo teníamos, añadimos por core_name:
+ebay_agg_full = ebay_agg.merge(
+    ebay[["brand_norm","name_norm","name_strong","core_name"]].drop_duplicates(),
     on=["brand_norm","name_norm"],
     how="left"
 )
 
-hit_rate = merged_exact["price_median_clipped"].notna().mean()
-print(f"Coverage exacto: {hit_rate:.1%}")
-
-
-
-# Instala rapidfuzz si no está (Kaggle lo permite)
-# !pip -q install rapidfuzz
-
-from rapidfuzz import process, fuzz
-
-unmatched = merged_exact[merged_exact["price_median_clipped"].isna()].copy()
-
-# Preparamos diccionario: brand_norm -> lista de (name_norm, price, ...)
-brand_to_ebay = {}
-for b, grp in ebay_agg.groupby("brand_norm"):
-    brand_to_ebay[b] = list(zip(grp["name_norm"], grp["price_median_clipped"]))
-
-def best_match_within_brand(brand_norm, name_norm, min_score=90):
-    cand = brand_to_ebay.get(brand_norm, [])
-    if not cand:
-        return (None, np.nan, 0)
-    names = [c[0] for c in cand]
-    # usamos ratio parcial que tolera prefijos/sufijos (EDP/EDT, etc.)
-    match = process.extractOne(
-        name_norm, names, scorer=fuzz.token_set_ratio
-    )
-    if match is None:
-        return (None, np.nan, 0)
-    best_name, score, idx = match[0], match[1], match[2]
-    price = cand[idx][1]
-    return (best_name, price, score)
-
-res = unmatched.apply(
-    lambda r: pd.Series(best_match_within_brand(r["brand_norm"], r["name_norm"], min_score=90),
-                        index=["ebay_name_norm_match","price_fuzzy","fuzzy_score"]),
-    axis=1
+# ---------- 7bis) MATCHING EXACTO ampliado ----------
+# 7.1 exacto clásico (brand_norm + name_norm)
+merged_exact = base.merge(
+    ebay_agg_full,
+    on=["brand_norm","name_norm"],
+    how="left",
+    suffixes=("","_ebay")
 )
 
-unmatched = pd.concat([unmatched.reset_index(drop=True), res], axis=1)
+# 7.2 exacto por (brand_norm + core_name) para los no matcheados
+mask_missing = merged_exact["price_median_clipped"].isna()
+if mask_missing.any():
+    aux = base.loc[mask_missing, ["brand_norm","core_name"]].merge(
+        ebay_agg_full[["brand_norm","core_name","price_median_clipped"]],
+        on=["brand_norm","core_name"],
+        how="left"
+    )
+    merged_exact.loc[mask_missing, "price_median_clipped"] = aux["price_median_clipped"].values
 
-# Aceptamos matches con score >= 90 (ajusta a 85 si quieres más cobertura)
-accepted = unmatched[unmatched["fuzzy_score"] >= 90].copy()
+print(f"Coverage exacto (ampliado): {merged_exact['price_median_clipped'].notna().mean():.1%}")
 
-# Integramos los precios fuzzy en merged_exact donde falte
+# ---------- 8bis) MATCHING DIFUSO mejorado ----------
 merged = merged_exact.copy()
-mask = merged["price_median_clipped"].isna()
-merged.loc[mask, "price_median_clipped"] = accepted.set_index(merged.loc[mask].index)["price_fuzzy"]
+if HAS_RAPIDFUZZ:
+    from rapidfuzz import process, fuzz
 
+    mask_unmatched = merged["price_median_clipped"].isna()
+    unmatched = merged.loc[mask_unmatched, ["brand_norm","name_strong","core_name"]].copy()
 
-# Prioriza precio limpio y robusto
-merged["price"] = merged["price_median_clipped"]
+    # Índices por marca
+    brand_to_ebay = {}
+    for b, grp in ebay_agg_full.groupby("brand_norm"):
+        brand_to_ebay[b] = grp[["name_strong","core_name","price_median_clipped"]].dropna(subset=["price_median_clipped"]).values.tolist()
+        # => lista de [name_strong, core_name, price]
 
-# Rangos fijos típicos (puedes ajustar a tu mercado)
+    def best_fuzzy(brand_norm, query_name, query_core, min_score=82):
+        cands = brand_to_ebay.get(brand_norm, [])
+        if not cands:
+            return pd.Series({"price_fuzzy": np.nan, "fuzzy_score": 0, "how":"none"})
+
+        # 1) fuzzy sobre name_strong (token_set_ratio)
+        names = [c[0] for c in cands]
+        match = process.extractOne(query_name, names, scorer=fuzz.token_set_ratio)
+        best_price, best_score, how = np.nan, 0, "none"
+        if match is not None:
+            idx = match[2]
+            best_price = cands[idx][2]
+            best_score = match[1]
+            how = "fuzzy_name"
+
+        # 2) contención de tokens (core ⊆ name_strong) como plan B
+        if (best_score < min_score) and query_core:
+            qset = set(query_core.split())
+            for n_str, c_core, pr in cands:
+                nset = set(str(n_str).split())
+                # si todos los tokens del core del query están en el candidato, acepta
+                if qset.issubset(nset):
+                    best_price, best_score, how = pr, 100, "token_subset"
+                    break
+        if best_score >= min_score or how == "token_subset":
+            return pd.Series({"price_fuzzy": best_price, "fuzzy_score": best_score, "how": how})
+        return pd.Series({"price_fuzzy": np.nan, "fuzzy_score": best_score, "how": how})
+
+    # ¡No resetees índice!
+    fuzzy_res = unmatched.apply(
+        lambda r: best_fuzzy(r["brand_norm"], r["name_strong"], r["core_name"], min_score=82), axis=1
+    )
+    to_assign = fuzzy_res["price_fuzzy"].notna()
+    assign_idx = unmatched.index[to_assign]
+
+    merged.loc[assign_idx, "price_median_clipped"] = fuzzy_res.loc[assign_idx, "price_fuzzy"].values
+
+    # Diagnóstico
+    print("Fuzzy asignados:", int(to_assign.sum()))
+    print(f"Cobertura total tras fuzzy: {merged['price_median_clipped'].notna().mean():.1%}")
+else:
+    print("[INFO] Saltando matching difuso (rapidfuzz no disponible).")
+
+# ---------- 9) PRECIO FINAL + RANGOS ----------
+merged["price"] = pd.to_numeric(merged["price_median_clipped"], errors="coerce")
+
 def price_range(p):
-    if pd.isna(p):
-        return "unknown"
+    if pd.isna(p): return "unknown"
     if p < 30:   return "low"
     if p < 70:   return "medium"
     if p < 120:  return "high"
@@ -223,24 +340,13 @@ def price_range(p):
 
 merged["price_range"] = merged["price"].apply(price_range)
 
-# (Alternativa dinámica por cuantiles – útil si tu conjunto es “raro”)
-def price_bucket_quantiles(s, qs=(0.25,0.5,0.75)):
-    q1,q2,q3 = s.quantile(qs)
-    def b(p):
-        if pd.isna(p): return "unknown"
-        if p <= q1: return "low"
-        if p <= q2: return "medium"
-        if p <= q3: return "high"
-        return "luxury"
-    return s.apply(b)
-
-# merged["price_range"] = price_bucket_quantiles(merged["price"])
-
+# ---------- 10) Checks y export ----------
 total = len(base)
 with_price = merged["price"].notna().sum()
 print(f"Perfumes con precio: {with_price}/{total} = {with_price/total:.1%}")
 
+print("\nEjemplos (brand, name, price, price_range):")
 print(merged[["brand","name","price","price_range"]].head(10))
 
-# guarda para posteriores notebooks/pasos
-merged.to_csv("perfumes_merged_with_prices.csv", index=False)
+merged.to_csv("perfumes_merged_with_prices.csv", index=False, encoding="utf-8")
+print("\n[OK] Guardado: perfumes_merged_with_prices.csv")
